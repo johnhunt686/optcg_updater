@@ -52,9 +52,9 @@ run_wizard() {
         --excluded-folder "$e" >/dev/null
 
     if [ -n "$i" ]; then
-        mkdir -p "$(expand_tilde "$i")" && echo "install dir ready: $i"
+        mkdir -p "$(expand_tilde "$i")" && echo "install folder created (empty — no app yet): $i"
     fi
-    echo "settings saved."
+    echo "settings saved. Run Update or Launch to install the app."
 }
 
 confirm() {
@@ -70,7 +70,8 @@ is_ready || { echo "config incomplete — running setup."; run_wizard; }
 PS3=$'\n''choose> '
 while true; do
     echo
-    echo "== app: $(cfg_get install_dir)  (installed: $(cfg_get installed_version || echo none)) =="
+    iv="$(cfg_get installed_version)"
+    echo "== app: $(cfg_get install_dir)  (installed: ${iv:-none}) =="
     select choice in "Launch app" "Check version" "Update" "Rollback" "Settings" "Quit"; do
         case "${REPLY:-}" in
             1) exec "$PY" "$UPDATER" launch ;;            # becomes util, spawns app, exits
