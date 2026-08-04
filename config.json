@@ -1,0 +1,11 @@
+{
+  "version_url": "https://optcgsim.com/",
+  "version_regex": "\\d+\\.\\d+[a-z]?",
+  "link_match": "dropbox\\.com|dropboxusercontent\\.com|\\.zip(\\?|$)",
+  "source_url": "",
+  "install_dir": "~/Projects/OPTCGsim",
+  "excluded_folder": "decks",
+  "installed_version": "1.41b",
+  "launch_cmd": "./OPTCGSim.x86_64",
+  "platform": "auto"
+}

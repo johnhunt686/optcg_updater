@@ -44,9 +44,25 @@ DEFAULT_CONFIG = {
     "excluded_folder": "decks",        # top-level folder in zip to skip (user data)
     "installed_version": None,         # last version we installed
     "launch_cmd": "",                  # command to start the app, run with cwd=install_dir
+    "platform": "auto",                # auto/windows/mac/linux/android/ios
 }
 
 UA = {"User-Agent": "updater/1.0"}
+PLATFORM_ALIASES = {
+    "windows": ("windows", "win"),
+    "mac": ("mac", "macos", "osx"),
+    "linux": ("linux",),
+    "android": ("android",),
+    "ios": ("ios", "iphone", "ipad"),
+}
+PLATFORM_LABELS = {
+    "auto": "auto",
+    "windows": "Windows",
+    "mac": "Mac",
+    "linux": "Linux",
+    "android": "Android",
+    "ios": "iOS",
+}
 
 
 class UpdaterError(Exception):
@@ -78,6 +94,43 @@ def resolve_install_dir(cfg: dict) -> Path:
     return Path(raw).expanduser().resolve()
 
 
+def normalize_platform(value: str | None) -> str:
+    if not value:
+        return "auto"
+    value = value.strip().lower()
+    if value in PLATFORM_ALIASES:
+        return value
+    for name, aliases in PLATFORM_ALIASES.items():
+        if value in aliases:
+            return name
+    return "auto"
+
+
+def resolve_platform(cfg: dict, requested: str | None = None) -> str:
+    if requested:
+        return normalize_platform(requested)
+    raw = (cfg.get("platform") or "auto").strip()
+    normalized = normalize_platform(raw)
+    if normalized != "auto":
+        return normalized
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform == "darwin":
+        return "mac"
+    if sys.platform.startswith("win"):
+        return "windows"
+    return "auto"
+
+
+def _platform_matches(href: str, text: str, platform: str) -> bool:
+    if platform == "auto":
+        return False
+    keywords = PLATFORM_ALIASES.get(platform, ())
+    lowered_href = href.lower()
+    lowered_text = text.lower()
+    return any(keyword in lowered_href or keyword in lowered_text for keyword in keywords)
+
+
 # --------------------------------------------------------------------------
 # url handling  (Dropbox + direct only; Google Drive intentionally skipped)
 # --------------------------------------------------------------------------
@@ -100,13 +153,101 @@ class LinkParser(HTMLParser):
 
     def __init__(self) -> None:
         super().__init__()
-        self.hrefs: list[str] = []
+        self.links: list[dict[str, object]] = []
+        self._stack: list[dict[str, object]] = []
 
     def handle_starttag(self, tag, attrs):
         if tag == "a":
-            href = dict(attrs).get("href")
+            attrs_map = dict(attrs)
+            href = attrs_map.get("href")
             if href:
-                self.hrefs.append(href)
+                self._stack.append({"href": href, "attrs": attrs_map, "text": []})
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._stack:
+            self.links.append(self._stack.pop())
+
+    def handle_data(self, data):
+        if self._stack:
+            self._stack[-1]["text"].append(data)
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+class TextParser(HTMLParser):
+    """Extract visible text from HTML while skipping script/style content."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.text_parts: list[str] = []
+        self._skip_content = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style"}:
+            self._skip_content = True
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style"}:
+            self._skip_content = False
+
+    def handle_data(self, data):
+        if not self._skip_content:
+            self.text_parts.append(data)
+
+    def get_text(self) -> str:
+        return _normalize_text(" ".join(self.text_parts))
+
+
+def _extract_version_from_text(text: str, version_regex: str) -> str | None:
+    if not text:
+        return None
+    m = re.search(version_regex, text, re.IGNORECASE)
+    return m.group(0) if m else None
+
+
+def _extract_version_from_url(url: str, version_regex: str) -> str | None:
+    return _extract_version_from_text(url, version_regex)
+
+
+def _is_placeholder_version(version: str | None, version_regex: str) -> bool:
+    if not version:
+        return True
+    if version.lower() in {"latest", "unknown", "n/a", "none", "placeholder", ""}:
+        return True
+    return False
+
+
+def _select_download_link(links: list[dict[str, object]], base_url: str, link_match: str, platform: str = "auto"):
+    lm = re.compile(link_match, re.IGNORECASE)
+
+    for link in links:
+        href = str(link["href"])
+        if not lm.search(href):
+            continue
+        text = _normalize_text("".join(link["text"]))
+        lowered = text.lower()
+        if platform != "auto" and _platform_matches(href, text, platform):
+            if "main download" in lowered and "mirror" not in lowered:
+                return urllib.parse.urljoin(base_url, href)
+            if "mirror" not in lowered:
+                return urllib.parse.urljoin(base_url, href)
+
+    for link in links:
+        href = str(link["href"])
+        if not lm.search(href):
+            continue
+        text = _normalize_text("".join(link["text"]))
+        lowered = text.lower()
+        if "main download" in lowered and "mirror" not in lowered:
+            return urllib.parse.urljoin(base_url, href)
+
+    for link in links:
+        href = str(link["href"])
+        if lm.search(href):
+            return urllib.parse.urljoin(base_url, href)
+    return None
 
 
 def fetch_text(url: str) -> str:
@@ -116,19 +257,20 @@ def fetch_text(url: str) -> str:
         return resp.read().decode(charset, "replace")
 
 
-def scrape_page(html: str, base_url: str, version_regex: str, link_match: str):
-    """Return (version, download_url). Either may be None if not found."""
-    m = re.search(version_regex, html)
-    version = m.group(0) if m else None
-
+def scrape_page(html: str, base_url: str, version_regex: str, link_match: str, platform: str = "auto"):
+    """Return (version, download_url). Prefer the site page version and only fall back to link-derived versions when needed."""
     parser = LinkParser()
     parser.feed(html)
-    lm = re.compile(link_match, re.IGNORECASE)
-    download_url = None
-    for href in parser.hrefs:
-        if lm.search(href):
-            download_url = urllib.parse.urljoin(base_url, href)  # resolve relative hrefs
-            break
+    download_url = _select_download_link(parser.links, base_url, link_match, platform)
+
+    visible_text = TextParser()
+    visible_text.feed(html)
+    version = _extract_version_from_text(visible_text.get_text(), version_regex)
+    url_version = _extract_version_from_url(download_url or "", version_regex) if download_url else None
+
+    if _is_placeholder_version(version, version_regex) and url_version:
+        version = url_version
+
     return version, download_url
 
 
@@ -149,6 +291,32 @@ def probe_link(url: str) -> bool:
 # --------------------------------------------------------------------------
 # download / extract
 # --------------------------------------------------------------------------
+def extract_version_from_zip(zip_path: Path, version_regex: str | None = None) -> str | None:
+    """Infer a version from archive names or paths when the page version is placeholder."""
+    if not zip_path.exists():
+        return None
+    regex = version_regex or r"\d+\.\d+[a-z]?"
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            candidates: list[str] = []
+            for name in zf.namelist():
+                for match in re.finditer(regex, name, re.IGNORECASE):
+                    candidates.append(match.group(0))
+            if not candidates:
+                return None
+
+            def score(value: str) -> tuple[int, int, int]:
+                return (
+                    len(value),
+                    value.count("."),
+                    sum(1 for ch in value if ch.isalpha()),
+                )
+
+            return max(candidates, key=score)
+    except zipfile.BadZipFile:
+        return None
+
+
 def download(url: str, dest: Path) -> None:
     direct = transform_url(url)
     print(f"downloading: {direct}")
@@ -242,7 +410,7 @@ def cmd_config(args) -> None:
     print(json.dumps(cfg, indent=2))
 
 
-def _scrape_site(cfg: dict):
+def _scrape_site(cfg: dict, platform: str | None = None):
     """Fetch version_url and return (version, download_url). Exits on no version_url."""
     vurl = cfg.get("version_url")
     if not vurl:
@@ -251,15 +419,17 @@ def _scrape_site(cfg: dict):
         html = fetch_text(vurl)
     except (urllib.error.HTTPError, urllib.error.URLError) as e:
         raise UpdaterError(f"version page unreachable ({e}). No changes made.")
-    return scrape_page(html, vurl, cfg["version_regex"], cfg["link_match"])
+    selected_platform = resolve_platform(cfg, platform)
+    return scrape_page(html, vurl, cfg["version_regex"], cfg["link_match"], selected_platform)
 
 
 def cmd_check(args) -> None:
     cfg = load_config()
-    version, dl = _scrape_site(cfg)
+    version, dl = _scrape_site(cfg, getattr(args, "platform", None))
     installed = cfg.get("installed_version")
     print(f"installed version: {installed}")
     print(f"site version:      {version or '(not found — check version_regex)'}")
+    print(f"platform:          {PLATFORM_LABELS.get(resolve_platform(cfg, getattr(args, 'platform', None)), resolve_platform(cfg, getattr(args, 'platform', None)))}")
     print(f"download link:     {dl or '(not found — check link_match)'}")
     if dl:
         print(f"link status:       {'alive' if probe_link(dl) else 'DOWN'}")
@@ -272,7 +442,8 @@ def cmd_check(args) -> None:
 def install_from_url(cfg: dict, url: str, install_dir: Path,
                      excluded: str, site_version) -> None:
     """Download+extract+backup+install. Raises UpdaterError if the link is down
-    (before any file is touched). Records site_version on success."""
+    (before any file is touched). Records the best available version on success."""
+    version_regex = cfg.get("version_regex") or DEFAULT_CONFIG["version_regex"]
     with tempfile.TemporaryDirectory(prefix="updater_") as tmp:
         tmp = Path(tmp)
         zip_path = tmp / "download.zip"
@@ -284,10 +455,16 @@ def install_from_url(cfg: dict, url: str, install_dir: Path,
         make_backup(install_dir)
         install_files(source_root, install_dir, excluded)
 
-    if site_version:
-        cfg["installed_version"] = site_version
+        resolved_version = site_version
+        if _is_placeholder_version(resolved_version, version_regex):
+            resolved_version = extract_version_from_zip(zip_path, version_regex) or resolved_version
+
+
+
+    if resolved_version:
+        cfg["installed_version"] = resolved_version
         save_config(cfg)
-        print(f"recorded installed_version: {site_version}")
+        print(f"recorded installed_version: {resolved_version}")
 
 
 def cmd_update(args) -> None:
@@ -299,7 +476,7 @@ def cmd_update(args) -> None:
     if args.url:                       # explicit one-off link, no scrape
         url = args.url
     else:
-        site_version, dl = _scrape_site(cfg)
+        site_version, dl = _scrape_site(cfg, getattr(args, "platform", None))
         if site_version and site_version == cfg.get("installed_version") and not args.force:
             print(f"up to date: {site_version} (use --force to reinstall)")
             return
@@ -322,7 +499,7 @@ def cmd_launch(args) -> None:
     # --- version check (soft: a down site warns but never blocks launch) ---
     if not args.no_update:
         try:
-            site_version, dl = _scrape_site(cfg)
+            site_version, dl = _scrape_site(cfg, getattr(args, "platform", None))
             installed = cfg.get("installed_version")
             if site_version and site_version != installed:
                 if _confirm_update(installed, site_version, args.yes):
@@ -387,6 +564,7 @@ def cmd_status(args) -> None:
     print(f"backup:            {bak if bak else '(n/a)'}")
     print(f"  exists:          {bak.exists() if bak else False}")
     print(f"excluded_folder:   {cfg.get('excluded_folder')}")
+    print(f"platform:          {PLATFORM_LABELS.get(resolve_platform(cfg), resolve_platform(cfg))}")
     print(f"installed_version: {cfg.get('installed_version')}")
     print(f"launch_cmd:        {cfg.get('launch_cmd') or '(unset)'}")
 
@@ -406,14 +584,17 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--install-dir", dest="install_dir")
     c.add_argument("--excluded-folder", dest="excluded_folder")
     c.add_argument("--launch-cmd", dest="launch_cmd")
+    c.add_argument("--platform", dest="platform")
     c.set_defaults(func=cmd_config)
 
     ck = sub.add_parser("check", help="scrape site: show installed vs latest + link status")
+    ck.add_argument("--platform", dest="platform")
     ck.set_defaults(func=cmd_check)
 
     u = sub.add_parser("update", help="scrape + install if version differs")
     u.add_argument("--url", help="one-off link, skips scrape entirely")
     u.add_argument("--force", action="store_true", help="reinstall even if version matches")
+    u.add_argument("--platform", dest="platform")
     u.set_defaults(func=cmd_update)
 
     r = sub.add_parser("rollback", help="restore the .bak backup")
@@ -425,6 +606,7 @@ def build_parser() -> argparse.ArgumentParser:
     ln = sub.add_parser("launch", help="check version (prompt to update), then start the app")
     ln.add_argument("--yes", action="store_true", help="auto-update without prompting")
     ln.add_argument("--no-update", action="store_true", help="skip version check, just launch")
+    ln.add_argument("--platform", dest="platform")
     ln.set_defaults(func=cmd_launch)
 
     return p
